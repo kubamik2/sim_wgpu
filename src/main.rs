@@ -1,5 +1,5 @@
 mod particle;
-mod stage;
+mod quadtree;
 use std::time::{Instant, Duration};
 
 use cgmath::{Point2, Vector3, Vector2};
