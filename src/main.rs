@@ -4,10 +4,11 @@ use std::time::{Instant, Duration};
 
 use cgmath::{Point2, Vector3, Vector2};
 use particle::*;
-
+use quadtree::*;
 use wgpu::util::DeviceExt;
 use winit::{event::{Event, WindowEvent, DeviceEvent, VirtualKeyCode, ElementState, MouseButton}, dpi::PhysicalSize};
 use imgui_winit_support::WinitPlatform;
+
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -19,26 +20,26 @@ struct WindowProperties {
 }
 
 struct Data {
-    avg_dt: [Duration; 144],
-    avg_compute_dt: [Duration; 144],
-    avg_render_dt: [Duration; 144],
+    avg_dt: Vec<Duration>,
+    avg_compute_dt: Vec<Duration>,
+    avg_render_dt: Vec<Duration>,
     gravity_constant: f32
 }
 
 impl Data {
-    fn avg_compute_dt(&self) -> Duration {
+    fn avg_compute_dt(&self, target_framerate: u32) -> Duration {
         let sum: Duration = self.avg_compute_dt.iter().sum();
-        sum / 144
+        sum / target_framerate
     }
 
-    fn avg_render_dt(&self) -> Duration {
+    fn avg_render_dt(&self, target_framerate: u32) -> Duration {
         let sum: Duration = self.avg_render_dt.iter().sum();
-        sum / 144
+        sum / target_framerate
     }
 
-    fn avg_dt(&self) -> Duration {
+    fn avg_dt(&self, target_framerate: u32) -> Duration {
         let sum: Duration = self.avg_dt.iter().sum();
-        sum / 144
+        sum / target_framerate
     }
 }
 
@@ -49,12 +50,13 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: winit::window::Window,
+    target_framerate: u32,
     render_pipeline: wgpu::RenderPipeline,
     imgui_renderer: imgui_wgpu::Renderer,
     imgui: imgui::Context,
     imgui_platform: imgui_winit_support::WinitPlatform,
     particle_mesh: ParticleMesh,
-    particles: Vec<Particle>,
+    linked_particles: Vec<(Particle, Option<usize>)>,
     window_properties_bind_group: wgpu::BindGroup,
     data: Data,
     gravity_constant_buffer: wgpu::Buffer,
@@ -99,12 +101,11 @@ impl State {
         };
 
         surface.configure(&device, &config);
-
         let particle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("particle_shader.wgsl").into())
         });
-
+        
         let window_properties = WindowProperties { dimensions: [size.width as f32, size.height as f32], aspect: size.width as f32 / size.height as f32, _padding: 0 };
         let window_properties_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("WindowProperties Bind Group Layout"),
@@ -293,28 +294,48 @@ impl State {
                 resource: gravity_constant_buffer.as_entire_binding()
             }]
         });
-
-        let data = Data { avg_dt: [Duration::ZERO; 144], avg_compute_dt: [Duration::ZERO; 144], avg_render_dt: [Duration::ZERO; 144], gravity_constant: 0.6674 as f32 };
-        Self { surface, device, queue, config, size, window, render_pipeline, imgui_renderer, imgui, imgui_platform, particle_mesh, particles, window_properties_bind_group, data, gravity_constant_buffer, gravity_constant_bind_group_layout, gravity_constant_bind_group }
+        let target_framerate = window.current_monitor().unwrap().refresh_rate_millihertz().unwrap() / 1000;
+        let data = Data { avg_dt: vec![Duration::ZERO; target_framerate as usize], avg_compute_dt: vec![Duration::ZERO; target_framerate as usize], avg_render_dt: vec![Duration::ZERO; target_framerate as usize], gravity_constant: 0.6674 as f32 };
+        Self { surface, device, queue, config, size, window, target_framerate, render_pipeline, imgui_renderer, imgui, imgui_platform, particle_mesh, linked_particles: particles, window_properties_bind_group, data, gravity_constant_buffer, gravity_constant_bind_group_layout, gravity_constant_bind_group }
     }
 
     fn update(&mut self, dt: Duration, frame: usize) {
         self.imgui.io_mut().update_delta_time(dt);
-        if self.particles.len() > 0 {
+        if self.linked_particles.len() > 0 {
             let now = Instant::now();
             self.queue.write_buffer(&self.gravity_constant_buffer, 0, bytemuck::cast_slice(&[self.data.gravity_constant]));
             let compute_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { 
                 label: Some("Compute Shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("compute_shader.wgsl").into())
             });
-            
-            let particle_compute_vec = self.particles.iter().map(|f| { let pos = f.position.clone(); [pos.x, pos.y]}).collect::<Vec<[f32; 2]>>();
+
+            let particle_compute_vec = self.linked_particles.iter().map(|f| {
+                ComputeLinkedParticle { position: f.0.position.into(), link: f.1.map(|index| index as i32).unwrap_or(-1), _padding: 0 }
+            }).collect::<Vec<_>>();
             let particle_compute_bytes = bytemuck::cast_slice(particle_compute_vec.as_slice());
             let particle_compute_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("ParticleCompute Buffer"),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 contents: particle_compute_bytes
             });
+
+            let grid = Grid::new(&mut self.linked_particles);
+
+            let grid_size_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Grid Size Buffer"),
+                usage: wgpu::BufferUsages::UNIFORM,
+                contents: bytemuck::cast_slice(&[grid.rows as u32, grid.cols as u32])
+            });
+
+            let compute_cell_grid: Vec<CellCompute> = grid.into();
+            let compute_cell_grid_bytes: &[u8] = bytemuck::cast_slice(compute_cell_grid.as_slice());
+            let compute_cell_grid_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ComputeCell Grid Buffer"),
+                usage: wgpu::BufferUsages::STORAGE,
+                contents: compute_cell_grid_bytes
+            });
+
+            
 
             let particle_compute_result_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ParticleCompute Result Buffer"),
@@ -353,6 +374,26 @@ impl State {
                         count: None,
                         visibility: wgpu::ShaderStages::COMPUTE
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None
+                        },
+                        count: None,
+                        visibility: wgpu::ShaderStages::COMPUTE
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None
+                        },
+                        count: None,
+                        visibility: wgpu::ShaderStages::COMPUTE
+                    },
                 ]
             });
 
@@ -367,6 +408,14 @@ impl State {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: particle_compute_result_buffer.as_entire_binding()
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: compute_cell_grid_buffer.as_entire_binding()
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: grid_size_buffer.as_entire_binding()
                     },
                 ]
             });
@@ -386,12 +435,7 @@ impl State {
                 module: &compute_shader,
                 entry_point: "cmp_main"
             });
-            let n = Instant::now();
-            let min_x = self.particles.iter().min_by_key(|f| f.position.x as i32);
-            let max_x = self.particles.iter().max_by_key(|f| f.position.x as i32);
-            let max_y = self.particles.iter().max_by_key(|f| f.position.y as i32);
-            let min_y = self.particles.iter().max_by_key(|f| f.position.y as i32);
-            dbg!(n.elapsed());
+
             let mut command_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Compute Encoder") });
             {
                 let mut compute_pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Compute Pass") });
@@ -414,17 +458,19 @@ impl State {
             let bytes = read_buffer.slice(..).get_mapped_range().to_vec();
 
             let mut acceleration_vec = vec![];
+            
             for i in 0..bytes.len() / 8 {
                 let offset = i * 8;
                 let x = f32::from_le_bytes([bytes[0 + offset], bytes[1 + offset], bytes[2 + offset], bytes[3 + offset]]);
                 let y = f32::from_le_bytes([bytes[4 + offset], bytes[5 + offset], bytes[6 + offset], bytes[7 + offset]]);
                 acceleration_vec.push(Vector2::new(x, y));
             }
-            for (i, particle) in self.particles.iter_mut().enumerate() {
-                particle.acceleration = acceleration_vec[i];
-                let new_pos = (particle.position * 2.0) - particle.prev_position + (particle.acceleration * dt.as_secs_f32() * dt.as_secs_f32());
-                particle.prev_position = particle.position;
-                particle.position = Point2::new(new_pos.x, new_pos.y);
+
+            for (i, linked_particle) in self.linked_particles.iter_mut().enumerate() {
+                linked_particle.0.acceleration = acceleration_vec[i];
+                let new_pos = (linked_particle.0.position * 2.0) - linked_particle.0.prev_position + (linked_particle.0.acceleration * dt.as_secs_f32() * dt.as_secs_f32());
+                linked_particle.0.prev_position = linked_particle.0.position;
+                linked_particle.0.position = Point2::new(new_pos.x, new_pos.y);
             }
 
             self.data.avg_compute_dt[frame] = now.elapsed();
@@ -447,13 +493,13 @@ impl State {
                 .position([0.0, 0.0], imgui::Condition::Always)
                 .bg_alpha(0.0)
                 .build(|| {
-                    ui.text(format!("dt: {:?}   {:.0} fps", self.data.avg_dt(), 1.0 / self.data.avg_dt().as_secs_f32()));
-                    ui.text(format!("compute_dt: {:?} ({:.0}%)", self.data.avg_compute_dt(), (self.data.avg_compute_dt().as_secs_f32() / dt) * 100.0));
-                    ui.text(format!("render_dt: {:?} ({:.0}%)", self.data.avg_render_dt(), (self.data.avg_render_dt().as_secs_f32() / dt) * 100.0));
+                    ui.text(format!("dt: {:?}   {:.0} fps", self.data.avg_dt(self.target_framerate), 1.0 / self.data.avg_dt(self.target_framerate).as_secs_f32()));
+                    ui.text(format!("compute_dt: {:?} ({:.0}%)", self.data.avg_compute_dt(self.target_framerate), (self.data.avg_compute_dt(self.target_framerate).as_secs_f32() / dt) * 100.0));
+                    ui.text(format!("render_dt: {:?} ({:.0}%)", self.data.avg_render_dt(self.target_framerate), (self.data.avg_render_dt(self.target_framerate).as_secs_f32() / dt) * 100.0));
                     ui.separator();
                     ui.text(format!("mouse_pos: {:?}", mouse_pos));
                     ui.separator();
-                    ui.text(format!("entities: {}", self.particles.len()));
+                    ui.text(format!("entities: {}", self.linked_particles.len()));
                     ui.separator();
                     ui.slider("G", 0.0, 6.0, &mut self.data.gravity_constant)
                 });
@@ -463,7 +509,7 @@ impl State {
         let particle_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Particle Buffer"),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            contents: bytemuck::cast_slice(self.particles.iter().cloned().map(|f| f.into()).collect::<Vec<ParticleRaw>>().as_slice())
+            contents: bytemuck::cast_slice(self.linked_particles.iter().cloned().map(|f| f.0.into()).collect::<Vec<ParticleRaw>>().as_slice())
         });
 
         let output = self.surface.get_current_texture()?;
@@ -485,7 +531,7 @@ impl State {
             render_pass.set_vertex_buffer(1, particle_buffer.slice(..));
             render_pass.set_index_buffer(self.particle_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-            render_pass.draw_indexed(0..self.particle_mesh.num_elements, 0, 0..self.particles.len() as u32);
+            render_pass.draw_indexed(0..self.particle_mesh.num_elements, 0, 0..self.linked_particles.len() as u32);
         }
 
         {
@@ -512,19 +558,17 @@ fn main() {
     env_logger::init();
     let event_loop = winit::event_loop::EventLoop::new();
     let window = winit::window::WindowBuilder::new().with_title("sim").build(&event_loop).unwrap();
-
     let mut state = futures::executor::block_on(State::new(window));
-    
+
     use rand::prelude::*;
     let mut rng = rand::thread_rng();
-    for _ in 0..30_000 {
+    for _ in 0..1000000 {
         let radius = 300.0 * rng.gen::<f32>();
         let radians = 2.0 * std::f32::consts::PI * rng.gen::<f32>();
         let x = radians.cos() * radius;
         let y = radians.sin() * radius;
-        let mut particle = Particle::new((x, y), 15.0, (0.1, 0.4, 1.0));
-        //particle.acceleration = ((rng.gen::<f32>() - 0.5) / 10.0, (rng.gen::<f32>() - 0.5) / 10.0).into();
-        state.particles.push(particle);
+        let particle = Particle::new((x, y), 15.0, (0.1, 0.4, 1.0));
+        state.linked_particles.push((particle, None));
     }
 
     let mut last_render_time = Instant::now();
@@ -546,13 +590,13 @@ fn main() {
                     WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                         let mouse_pos = state.imgui.io().mouse_pos;
                         let mut screen_space_pos = [(mouse_pos[0] - state.size.width as f32 / 2.0) * 1.0, 1.0 * (state.size.height as f32 - mouse_pos[1] - state.size.height as f32 / 2.0)];
-                        state.particles.push(Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)));
+                        state.linked_particles.push((Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)), None));
                         screen_space_pos[0] += 16.1;
-                        state.particles.push(Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)));
+                        state.linked_particles.push((Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)), None));
                         screen_space_pos[1] -= 12.2;
-                        state.particles.push(Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)));
+                        state.linked_particles.push((Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)), None));
                         screen_space_pos[0] -= 20.0;
-                        state.particles.push(Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)));
+                        state.linked_particles.push((Particle::new(screen_space_pos, 15.0, (0.1, 0.4, 1.0)), None));
                     },
                     _ => ()
                 }
@@ -566,7 +610,7 @@ fn main() {
                 state.update(dt, frame);
                 state.render(frame);
                 frame += 1;
-                if frame > 143 { frame = 0; }
+                if frame > (state.target_framerate - 1) as usize { frame = 0; }
             },
             Event::MainEventsCleared => {
                 state.window.request_redraw();

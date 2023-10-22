@@ -195,11 +195,92 @@ impl Vertex {
 //     }
 // }
 
-struct Grid {
-    cells: Vec<Option<Cell>>
+#[derive(Clone, Copy, Debug)]
+pub struct Cell {
+    pub mass: u32,
+    pub center_of_mass: Point2<f32>,
+    pub particle_index: usize
 }
 
-struct Cell {
-    average_position: Point2<f32>,
-    partcles: Vec<usize>
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct CellCompute {
+    pub mass_option: u32,
+    pub center_of_mass: [f32; 2],
+    pub particle_index: u32
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ComputeLinkedParticle {
+    pub position: [f32; 2],
+    pub link: i32,
+    pub _padding: u32
+}
+
+const GRID_SIZE: usize = 3;
+
+use cgmath::prelude::*;
+pub struct Grid {
+    pub rows: usize,
+    pub cols: usize,
+    pub cells: Vec<Vec<Option<Cell>>>,
+    
+}
+
+impl Grid {
+    #[inline]
+    pub fn new(linked_particles: &mut Vec<(Particle, Option<usize>)>) -> Self {
+        let positions = linked_particles.iter().map(|f| f.0.position.cast().unwrap()).collect::<Vec<Point2<i32>>>();
+
+        let min_x = positions.iter().min_by_key(|f| f.x).map(|f| f.x).unwrap();
+        let max_x = positions.iter().max_by_key(|f| f.x).map(|f| f.x).unwrap();
+        let max_y = positions.iter().max_by_key(|f| f.y).map(|f| f.y).unwrap();
+        let min_y = positions.iter().min_by_key(|f| f.y).map(|f| f.y).unwrap();
+
+        let cols = ((max_x - min_x).abs() as f32 / GRID_SIZE as f32).ceil() as usize + 1;
+        let rows = ((max_y - min_y).abs() as f32 / GRID_SIZE as f32).ceil() as usize + 1;
+
+        let mut cells: Vec<Vec<Option<Cell>>> = vec![vec![None; cols]; rows];
+
+        for ((i, linked_particle), position) in linked_particles.iter_mut().enumerate().zip(positions) {
+            let col_id = (position.x - min_x) as usize / GRID_SIZE;
+            let row_id = (max_y - position.y) as usize / GRID_SIZE;
+    
+            let cell = cells.get_mut(row_id).unwrap().get_mut(col_id).unwrap();
+            if let Some(cell) = cell {
+                linked_particle.1 = Some(cell.particle_index);
+                cell.center_of_mass.add_assign_element_wise(linked_particle.0.position);
+                cell.mass += 1;
+                cell.particle_index = i;
+            } else {
+                *cell = Some(Cell { mass: 1, center_of_mass: linked_particle.0.position, particle_index: i });
+            }
+        }
+
+        for row in cells.iter_mut() {
+            for cell in row.iter_mut() {
+                if let Some(cell) = cell {
+                    cell.center_of_mass /= cell.mass as f32;
+                }
+            }
+        }
+        
+        Self { cells, rows, cols }
+    }
+}
+
+impl Into<Vec<CellCompute>> for Grid {
+    fn into(self) -> Vec<CellCompute> {
+        self.cells.iter().cloned().map(|rows| {
+            rows.iter().cloned().map(|f| 
+                match f {
+                    Some(cell) => {
+                        CellCompute { mass_option: cell.mass | (1 << 31), center_of_mass: cell.center_of_mass.into(), particle_index: cell.particle_index as u32 }
+                    },
+                    None => CellCompute::default()
+                }
+            ).collect::<Vec<CellCompute>>()
+        }).flatten().collect::<Vec<CellCompute>>()
+    }
 }
